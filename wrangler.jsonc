@@ -7,9 +7,21 @@
 	],
 	"d1_databases": [
 		{
-			"binding": "cip_db",
-			"database_name": "cip_db",
-			"database_id": "fdc4fa72-053d-4969-9f30-6943c3cd47f5",
+			"binding": "councils_db",
+			"database_name": "cip-councils",
+			"database_id": "ddd07e81-ceb8-48aa-95a4-d1135e25ddc5",
+			"remote": true
+		},
+		{
+			"binding": "initiatives_db",
+			"database_name": "cip-initiatives",
+			"database_id": "edd66b74-5d62-470e-a285-58d97b2611a1",
+			"remote": true
+		},
+		{
+			"binding": "resources_db",
+			"database_name": "cip-resources",
+			"database_id": "25644255-321f-40ab-9f9c-7f4d9dd012a4",
 			"remote": true
 		}
 	]

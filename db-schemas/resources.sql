@@ -1,0 +1,31 @@
+-- resources_db: URLs, padlets, documents, projects
+
+CREATE TABLE padlets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  councilId TEXT NOT NULL,
+  padletType TEXT NOT NULL,
+  url TEXT NOT NULL,
+  createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(councilId, padletType)
+);
+
+CREATE TABLE projects (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  councilId TEXT NOT NULL,
+  title TEXT NOT NULL,
+  progress INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'Not Started',
+  createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE documents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  councilId TEXT NOT NULL,
+  title TEXT NOT NULL,
+  url TEXT NOT NULL,
+  documentType TEXT,
+  uploadedBy TEXT,
+  createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+);
