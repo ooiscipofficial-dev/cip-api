@@ -85,7 +85,7 @@ export default {
               // Get padlets from resources_db
               const padletResults = await env.resources_db.prepare(
                 "SELECT padletType, url FROM padlets WHERE councilId = ?"
-              ).all().bind(row.id);
+              ).bind(row.id).all();
 
               const padlets = {};
               if (padletResults?.results) {
@@ -158,14 +158,25 @@ export default {
 
           const mainProject = projectResult || { title: "", progress: 0, status: "Not Started" };
 
+          // Return data with proper info wrapper
           return json({
-            ...council,
+            id: council.id,
+            info: {
+              mission: council.mission,
+              achievement: council.achievement,
+              homepage: council.homepage,
+              name: council.name,
+              color: council.color,
+              googleEmail: council.googleEmail
+            },
             initiatives,
             pendingList,
             approvedList,
             rejectedList,
             mainProject,
-            padlets
+            padlets,
+            successfulInitiatives: [],
+            calendarEvents: []
           });
         } catch (err) {
           return json({ error: "FETCH_FAILED", details: err.message }, 500);
@@ -176,12 +187,20 @@ export default {
       if (path === "/api/council/save" && method === "POST") {
         try {
           const body = await request.json();
-          const { id, name, mission, achievement, homepage, color, googleEmail } = body;
+          const { id, name, mission, achievement, homepage, color, googleEmail, info } = body;
+
+          // Extract values from either top-level or info wrapper
+          const councilName = name || info?.name || '';
+          const councilMission = mission || info?.mission || '';
+          const councilAchievement = achievement || info?.achievement || '';
+          const councilHomepage = homepage || info?.homepage || '';
+          const councilColor = color || info?.color || '';
+          const councilEmail = googleEmail || info?.googleEmail || '';
 
           await env.councils_db.prepare(
-            "INSERT INTO councils (id, name, color, googleEmail, mission, achievement, homepage) VALUES (?, ?, ?, ?, ?, ?, ?) " +
-            "ON CONFLICT(id) DO UPDATE SET name = excluded.name, mission = excluded.mission, achievement = excluded.achievement, homepage = excluded.homepage, color = excluded.color, googleEmail = excluded.googleEmail"
-          ).bind(id, name, color, googleEmail, mission, achievement, homepage).run();
+            "INSERT INTO councils (id, name, color, googleEmail, mission, achievement, homepage, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
+            "ON CONFLICT(id) DO UPDATE SET name = excluded.name, mission = excluded.mission, achievement = excluded.achievement, homepage = excluded.homepage, color = excluded.color, googleEmail = excluded.googleEmail, updatedAt = CURRENT_TIMESTAMP"
+          ).bind(id, councilName, councilColor, councilEmail, councilMission, councilAchievement, councilHomepage).run();
 
           return json({ success: true });
         } catch (err) {
@@ -202,7 +221,7 @@ export default {
           // Insert new credentials
           const statements = Object.entries(credentials).map(([key, cred]) => {
             return env.councils_db.prepare(
-              "INSERT INTO credentials (councilId, username, password, name, role) VALUES (?, ?, ?, ?, ?)"
+              "INSERT INTO credentials (councilId, username, password, name, role, createdAt) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)"
             ).bind(councilId, cred.username, cred.password, cred.name, cred.role);
           });
 
@@ -226,8 +245,8 @@ export default {
           // Upsert padlets into resources_db
           const statements = Object.entries(padlets).map(([padletType, url]) => {
             return env.resources_db.prepare(
-              "INSERT INTO padlets (councilId, padletType, url) VALUES (?, ?, ?) " +
-              "ON CONFLICT(councilId, padletType) DO UPDATE SET url = excluded.url"
+              "INSERT INTO padlets (councilId, padletType, url, updatedAt) VALUES (?, ?, ?, CURRENT_TIMESTAMP) " +
+              "ON CONFLICT(councilId, padletType) DO UPDATE SET url = excluded.url, updatedAt = CURRENT_TIMESTAMP"
             ).bind(councilId, padletType, url);
           });
 
@@ -241,10 +260,103 @@ export default {
         }
       }
 
-      // ─── 8. MEMBERS: BULK SYNC ──────────────────────────────────────────
+      // ─── 8. SAVE INITIATIVE ─────────────────────────────────────────────
+      if (path === "/api/initiatives/save" && method === "POST") {
+        try {
+          const { councilId, id, title, description, objectives, expectedOutcomes, initiativeType, executionDate, status } = await request.json();
+
+          await env.initiatives_db.prepare(
+            "INSERT INTO initiatives (id, councilId, title, description, objectives, expectedOutcomes, initiativeType, executionDate, status, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
+            "ON CONFLICT(id) DO UPDATE SET title = excluded.title, description = excluded.description, objectives = excluded.objectives, expectedOutcomes = excluded.expectedOutcomes, initiativeType = excluded.initiativeType, executionDate = excluded.executionDate, status = excluded.status, updatedAt = CURRENT_TIMESTAMP"
+          ).bind(id, councilId, title, description, objectives, expectedOutcomes, initiativeType, executionDate, status || 'pending').run();
+
+          return json({ success: true });
+        } catch (err) {
+          return json({ error: "INITIATIVE_SAVE_FAILED", details: err.message }, 500);
+        }
+      }
+
+      // ─── 9. APPROVE INITIATIVE ──────────────────────────────────────────
+      if (path === "/api/initiatives/approve" && method === "POST") {
+        try {
+          const { councilId, initiativeId, reviewData } = await request.json();
+
+          // Update initiative status
+          await env.initiatives_db.prepare(
+            "UPDATE initiatives SET status = 'approved', updatedAt = CURRENT_TIMESTAMP WHERE id = ?"
+          ).bind(initiativeId).run();
+
+          // Log status change
+          await env.initiatives_db.prepare(
+            "INSERT INTO initiative_status_history (initiativeId, oldStatus, newStatus, changedAt) VALUES (?, 'pending', 'approved', CURRENT_TIMESTAMP)"
+          ).bind(initiativeId).run();
+
+          return json({ success: true });
+        } catch (err) {
+          return json({ error: "APPROVE_FAILED", details: err.message }, 500);
+        }
+      }
+
+      // ─── 10. REJECT INITIATIVE ──────────────────────────────────────────
+      if (path === "/api/initiatives/reject" && method === "POST") {
+        try {
+          const { councilId, initiativeId, reason } = await request.json();
+
+          // Update initiative status
+          await env.initiatives_db.prepare(
+            "UPDATE initiatives SET status = 'rejected', updatedAt = CURRENT_TIMESTAMP WHERE id = ?"
+          ).bind(initiativeId).run();
+
+          // Log status change
+          await env.initiatives_db.prepare(
+            "INSERT INTO initiative_status_history (initiativeId, oldStatus, newStatus, reason, changedAt) VALUES (?, 'pending', 'rejected', ?, CURRENT_TIMESTAMP)"
+          ).bind(initiativeId, reason || '').run();
+
+          return json({ success: true });
+        } catch (err) {
+          return json({ error: "REJECT_FAILED", details: err.message }, 500);
+        }
+      }
+
+      // ─── 11. ADD COMMENT ────────────────────────────────────────────────
+      if (path === "/api/initiatives/comment" && method === "POST") {
+        try {
+          const { councilId, initiativeId, comment } = await request.json();
+
+          await env.initiatives_db.prepare(
+            "INSERT INTO manager_comments (initiativeId, comment, createdAt) VALUES (?, ?, CURRENT_TIMESTAMP)"
+          ).bind(initiativeId, comment).run();
+
+          return json({ success: true });
+        } catch (err) {
+          return json({ error: "COMMENT_FAILED", details: err.message }, 500);
+        }
+      }
+
+      // ─── 12. DELETE INITIATIVE ──────────────────────────────────────────
+      if (path === "/api/initiatives/delete" && method === "POST") {
+        try {
+          const { councilId, initiativeId } = await request.json();
+
+          // Delete related records first
+          await env.initiatives_db.prepare("DELETE FROM manager_comments WHERE initiativeId = ?").bind(initiativeId).run();
+          await env.initiatives_db.prepare("DELETE FROM progress_reports WHERE initiativeId = ?").bind(initiativeId).run();
+          await env.initiatives_db.prepare("DELETE FROM initiative_leads WHERE initiativeId = ?").bind(initiativeId).run();
+          await env.initiatives_db.prepare("DELETE FROM initiative_contributors WHERE initiativeId = ?").bind(initiativeId).run();
+
+          // Delete the initiative
+          await env.initiatives_db.prepare("DELETE FROM initiatives WHERE id = ?").bind(initiativeId).run();
+
+          return json({ success: true });
+        } catch (err) {
+          return json({ error: "DELETE_FAILED", details: err.message }, 500);
+        }
+      }
+
+      // ─── 13. MEMBERS: BULK SYNC ──────────────────────────────────────────
       if (path === "/api/members/sync" && method === "POST") {
         try {
-          const { councilId, members } = await readBody();
+          const { councilId, members } = await request.json();
 
           // Clear existing members for this council
           await env.councils_db.prepare(
@@ -254,7 +366,7 @@ export default {
           // Insert new members
           const statements = Object.entries(members).map(([key, m]) => {
             return env.councils_db.prepare(
-              "INSERT INTO members (councilId, memberKey, name, role, username, password) VALUES (?, ?, ?, ?, ?, ?)"
+              "INSERT INTO members (councilId, memberKey, name, role, username, password, createdAt) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)"
             ).bind(councilId, key, m.name, m.role, m.username, m.password);
           });
 
@@ -268,7 +380,7 @@ export default {
         }
       }
 
-      // ─── 9. SYSTEM WIPE ─────────────────────────────────────────────────
+      // ─── 14. SYSTEM WIPE ─────────────────────────────────────────────────
       if (path === "/api/system/wipe" && method === "POST") {
         try {
           await env.councils_db.prepare("DELETE FROM councils").run();
@@ -277,6 +389,9 @@ export default {
           await env.initiatives_db.prepare("DELETE FROM initiatives").run();
           await env.initiatives_db.prepare("DELETE FROM progress_reports").run();
           await env.initiatives_db.prepare("DELETE FROM manager_comments").run();
+          await env.initiatives_db.prepare("DELETE FROM initiative_status_history").run();
+          await env.initiatives_db.prepare("DELETE FROM initiative_leads").run();
+          await env.initiatives_db.prepare("DELETE FROM initiative_contributors").run();
           await env.resources_db.prepare("DELETE FROM padlets").run();
           await env.resources_db.prepare("DELETE FROM projects").run();
           await env.resources_db.prepare("DELETE FROM documents").run();
