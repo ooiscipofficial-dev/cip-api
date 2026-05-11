@@ -9,8 +9,42 @@ const corsHeaders = () => ({
   "Access-Control-Allow-Headers": "Content-Type",
 });
 
+function isTruthyFlag(value) {
+  return value === true || value === 1 || value === "1";
+}
+
+function clampScore(value, min = 0, max = 100) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function calculateImpactScore(data = {}) {
+  const initiatives = data.initiatives || [];
+  const approved = data.approvedList || data.approved || initiatives.filter(i => i.status === "approved");
+  const successful = data.successfulInitiatives || initiatives.filter(i => isTruthyFlag(i.isSuccessful));
+  const rejected = data.rejectedList || data.rejected || initiatives.filter(i => i.status === "rejected");
+  const rawBase = Number(data.baseScore ?? data.info?.baseScore ?? 0);
+  const base = Number.isFinite(rawBase) ? clampScore(rawBase, 0, 50) : 0;
+
+  const activity = Math.min(initiatives.length * 0.5, 10);
+  const approval = Math.min(approved.length * 1.0, 10);
+  const execution = Math.min(successful.length * 3.0, 30);
+  const rejectionPenalty = Math.min(rejected.length * 1.5, 15);
+
+  const today = new Date().toISOString().split("T")[0];
+  const overdue = initiatives.filter(i =>
+    i.executionDate &&
+    i.executionDate < today &&
+    !isTruthyFlag(i.isSuccessful)
+  ).length * 2;
+
+  const inactivity = initiatives.length === 0 ? 5 : 0;
+  const score = base + activity + approval + execution - rejectionPenalty - overdue - inactivity;
+
+  return clampScore(Math.round(score));
+}
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
     try {
@@ -71,43 +105,122 @@ export default {
         return json({ success: false, error: "Invalid Credentials" }, 401);
       }
 
-      // ─── 3. GET ALL COUNCILS ────────────────────────────────────────────
+      // ─── 3. GET ALL COUNCILS (BASIC) ───────────────────────────────────
       if (path === "/api/councils/all" && method === "GET") {
         try {
           const { results } = await env.councils_db.prepare(
-            "SELECT id, name, color, googleEmail, mission, achievement, homepage FROM councils"
+            "SELECT id, name, color, googleEmail, mission, achievement, homepage FROM councils WHERE id != 'system'"
           ).all();
-
-          const allData = {};
-
-          if (results && results.length > 0) {
-            for (const row of results) {
-              // Get padlets from resources_db
-              const padletResults = await env.resources_db.prepare(
-                "SELECT padletType, url FROM padlets WHERE councilId = ?"
-              ).bind(row.id).all();
-
-              const padlets = {};
-              if (padletResults?.results) {
-                padletResults.results.forEach(p => {
-                  padlets[p.padletType] = p.url;
-                });
-              }
-
-              allData[row.id] = {
-                ...row,
-                padlets
-              };
-            }
-          }
-
-          return json(allData);
+          return json(results.reduce((acc, row) => ({ ...acc, [row.id]: row }), {}));
         } catch (err) {
           return json({ error: "QUERY_FAILED", details: err.message }, 500);
         }
       }
 
-      // ─── 4. GET COUNCIL DATA ────────────────────────────────────────────
+      // ─── 4.0 SUPER-AGGREGATE: GET EVERYTHING FOR ALL COUNCILS ──────────
+      // This endpoint replaces 14+ individual fetches with a single bulk query
+      if (path.endsWith("/api/councils/full") || path.endsWith("/councils/full")) {
+        try {
+          // 1. Fetch all core councils
+          const { results: councils } = await env.councils_db.prepare(
+            "SELECT id, name, color, googleEmail, mission, achievement, homepage FROM councils WHERE id != 'system'"
+          ).all();
+
+          // 2. Fetch all related data in BULK (minimizing D1 roundtrips)
+          const { results: allInitiatives } = await env.initiatives_db.prepare("SELECT * FROM initiatives").all();
+          const { results: allComments } = await env.initiatives_db.prepare("SELECT * FROM manager_comments").all();
+          const { results: allLeads } = await env.initiatives_db.prepare("SELECT * FROM initiative_leads").all();
+          const { results: allContributors } = await env.initiatives_db.prepare("SELECT * FROM initiative_contributors").all();
+          const { results: allReports } = await env.initiatives_db.prepare("SELECT * FROM progress_reports").all();
+          const { results: allPadlets } = await env.resources_db.prepare("SELECT * FROM padlets").all();
+          const { results: allProjects } = await env.resources_db.prepare("SELECT * FROM projects").all();
+          const { results: allAnalysis } = await env.resources_db.prepare("SELECT * FROM strategic_analysis").all();
+          const { results: allTimelineEvents } = await env.resources_db.prepare("SELECT * FROM timeline_events ORDER BY eventDate ASC").all();
+
+          const fullData = {};
+
+          for (const c of councils) {
+            const id = c.id;
+            const initiatives = allInitiatives.filter(i => i.councilId === id);
+            
+            // Hydrate initiatives
+            for (let init of initiatives) {
+              init.managerComments = allComments.filter(cm => cm.initiativeId === init.id);
+              init.lead = allLeads.find(l => l.initiativeId === init.id) || { name: "Pending", role: "Initiative Lead" };
+              init.contributors = allContributors.filter(con => con.initiativeId === init.id);
+              init.progressReports = allReports.filter(r => r.initiativeId === init.id);
+              init.execution = [
+                { phase: "Planning", note: "Strategy and resource mapping.", status: "Completed" },
+                { phase: "Execution", note: "Active deployment.", status: init.status === 'approved' ? 'Completed' : 'In Progress' },
+                { phase: "Feedback", note: "Outcome assessment.", status: init.status === 'approved' ? 'Completed' : 'Not Started' }
+              ];
+              init.summary = init.description || "Council-led initiative.";
+            }
+
+            const padlets = {};
+            allPadlets.filter(p => p.councilId === id).forEach(p => padlets[p.padletType] = p.url);
+
+            const calendarEvents = initiatives.map(i => ({
+              date: i.executionDate || i.createdAt,
+              title: i.title,
+              status: i.status,
+              initiativeId: i.id
+            }));
+            const successfulInitiatives = initiatives.filter(i => isTruthyFlag(i.isSuccessful));
+            const councilRecord = {
+              id: id,
+              info: { ...c },
+              initiatives,
+              pendingList: initiatives.filter(i => i.status === 'pending'),
+              approvedList: initiatives.filter(i => i.status === 'approved'),
+              rejectedList: initiatives.filter(i => i.status === 'rejected'),
+              successfulInitiatives,
+              mainProject: allProjects.find(p => p.councilId === id) || { title: "", progress: 0, status: "Not Started" },
+              padlets,
+              strategicAnalysis: allAnalysis.find(a => a.councilId === id) || { summary: "Strategic overview pending.", strengths: "[]", risks: "[]", focus: "[]" },
+              timelineEvents: allTimelineEvents.filter(e => e.councilId === id),
+              calendarEvents
+            };
+            councilRecord.impactScore = calculateImpactScore(councilRecord);
+            councilRecord.info.impactScore = councilRecord.impactScore;
+            fullData[id] = councilRecord;
+          }
+
+          const response = new Response(JSON.stringify(fullData), {
+            headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
+          });
+          return response;
+
+        } catch (err) {
+          return json({ error: "AGGREGATION_FAILED", details: err.message }, 500);
+        }
+      }
+
+      // ─── 4.1 GET GLOBAL ACTIVITY ──────────────────────────────────────
+      if (path === "/api/system/activity" && method === "GET") {
+        try {
+          // Get last 10 initiatives
+          const { results: initiatives } = await env.initiatives_db.prepare(
+            "SELECT i.title, i.councilId, i.status, i.updatedAt as date, c.name as councilName " +
+            "FROM initiatives i JOIN councils c ON i.councilId = c.id " +
+            "ORDER BY i.updatedAt DESC LIMIT 10"
+          ).all();
+
+          const activity = initiatives.map(i => ({
+            date: i.date.split(' ')[0],
+            tag: i.status === 'approved' ? 'ok' : i.status === 'rejected' ? 'info' : 'event',
+            label: i.status,
+            msg: `${i.councilName} · ${i.title}`,
+            initiativeId: i.id
+          }));
+
+          return json({ activity });
+        } catch (err) {
+          return json({ error: "ACTIVITY_FETCH_FAILED", details: err.message }, 500);
+        }
+      }
+
+      // ─── 4.2 GET COUNCIL DATA ────────────────────────────────────────────
       if (path === "/api/council/data" && method === "GET") {
         const id = url.searchParams.get("id");
 
@@ -124,6 +237,8 @@ export default {
               pendingList: [],
               approvedList: [],
               rejectedList: [],
+              successfulInitiatives: [],
+              impactScore: 0,
               mainProject: { title: "", progress: 0, status: "Not Started" },
               padlets: { internal: "", personal: "", showcase: "" }
             });
@@ -135,9 +250,50 @@ export default {
           ).bind(id).all();
 
           const initiatives = initiativesResult?.results || [];
+
+          // Get manager comments
+          const commentsResult = await env.initiatives_db.prepare(
+            "SELECT mc.id, mc.initiativeId, mc.comment as text, mc.createdBy as author, mc.createdAt as date " +
+            "FROM manager_comments mc JOIN initiatives i ON mc.initiativeId = i.id " +
+            "WHERE i.councilId = ?"
+          ).bind(id).all();
+          
+          const allComments = commentsResult?.results || [];
+          
+          // Get leads for all initiatives of this council
+          const { results: allLeads } = await env.initiatives_db.prepare(
+            "SELECT il.* FROM initiative_leads il JOIN initiatives i ON il.initiativeId = i.id WHERE i.councilId = ?"
+          ).bind(id).all();
+
+          // Get contributors for all initiatives of this council
+          const { results: allContributors } = await env.initiatives_db.prepare(
+            "SELECT ic.* FROM initiative_contributors ic JOIN initiatives i ON ic.initiativeId = i.id WHERE i.councilId = ?"
+          ).bind(id).all();
+
+          // Get progress reports
+          const { results: allReports } = await env.initiatives_db.prepare(
+            "SELECT pr.* FROM progress_reports pr JOIN initiatives i ON pr.initiativeId = i.id WHERE i.councilId = ?"
+          ).bind(id).all();
+
+          for (let init of initiatives) {
+            init.managerComments = allComments.filter(c => c.initiativeId === init.id);
+            init.lead = allLeads.find(l => l.initiativeId === init.id) || { name: "Pending", role: "Initiative Lead" };
+            init.contributors = allContributors.filter(c => c.initiativeId === init.id);
+            init.progressReports = allReports.filter(r => r.initiativeId === init.id);
+            
+            // Format for frontend expectations
+            init.execution = [
+              { phase: "Planning", note: "Strategy and resource mapping.", status: "Completed" },
+              { phase: "Execution", note: "Active deployment and student engagement.", status: init.status === 'approved' ? 'Completed' : 'In Progress' },
+              { phase: "Feedback", note: "Outcome assessment and teacher review.", status: init.status === 'approved' ? 'Completed' : 'Not Started' }
+            ];
+            init.summary = init.description || "Council-led initiative focused on community impact and platform innovation.";
+          }
+
           const pendingList = initiatives.filter(i => i.status === 'pending');
           const approvedList = initiatives.filter(i => i.status === 'approved');
           const rejectedList = initiatives.filter(i => i.status === 'rejected');
+          const successfulInitiatives = initiatives.filter(i => isTruthyFlag(i.isSuccessful));
 
           // Get padlets from resources_db
           const padletsResult = await env.resources_db.prepare(
@@ -158,16 +314,68 @@ export default {
 
           const mainProject = projectResult || { title: "", progress: 0, status: "Not Started" };
 
+          // Get credentials from councils_db
+          const credsResult = await env.councils_db.prepare(
+            "SELECT username, password, name, role FROM credentials WHERE councilId = ?"
+          ).bind(id).all();
+
+          const credentials = {};
+          if (credsResult?.results) {
+            credsResult.results.forEach((c, i) => {
+              credentials[`member_${i}`] = { 
+                username: c.username, 
+                password: c.password, 
+                name: c.name, 
+                role: c.role 
+              };
+            });
+            // Try to set admin in 'username' key to match legacy frontend format
+            const admin = credsResult.results.find(c => c.role === 'Council Lead' || c.username === 'admin');
+            if (admin) {
+              credentials['username'] = admin;
+            }
+          }
+
+          // Get strategic analysis from resources_db
+          const analysis = await env.resources_db.prepare(
+            "SELECT summary, strengths, risks, focus FROM strategic_analysis WHERE councilId = ?"
+          ).bind(id).first();
+
+          // Get timeline events from resources_db
+          const timelineResult = await env.resources_db.prepare(
+            "SELECT eventDate as date, title, note FROM timeline_events WHERE councilId = ? ORDER BY eventDate ASC"
+          ).bind(id).all();
+          const timelineEvents = timelineResult?.results || [];
+          const calendarEvents = initiatives.map(i => ({
+            date: i.executionDate || i.createdAt,
+            title: i.title,
+            description: i.description || "Active initiative from council operations.",
+            type: i.status === "approved" ? "Completed" : "Pending",
+            status: i.status,
+            initiativeId: i.id
+          }));
+          const impactScore = calculateImpactScore({
+            initiatives,
+            pendingList,
+            approvedList,
+            rejectedList,
+            successfulInitiatives,
+            mainProject,
+            calendarEvents
+          });
+
           // Return data with proper info wrapper
           return json({
             id: council.id,
+            impactScore,
             info: {
               mission: council.mission,
               achievement: council.achievement,
               homepage: council.homepage,
               name: council.name,
               color: council.color,
-              googleEmail: council.googleEmail
+              googleEmail: council.googleEmail,
+              impactScore
             },
             initiatives,
             pendingList,
@@ -175,11 +383,48 @@ export default {
             rejectedList,
             mainProject,
             padlets,
-            successfulInitiatives: [],
-            calendarEvents: []
+            credentials,
+            successfulInitiatives,
+            calendarEvents,
+            strategicAnalysis: analysis || { 
+              summary: "Strategic overview pending manager analysis.", 
+              strengths: "[]", 
+              risks: "[]", 
+              focus: "[]" 
+            },
+            timelineEvents
           });
         } catch (err) {
           return json({ error: "FETCH_FAILED", details: err.message }, 500);
+        }
+      }
+
+      // ─── 4.5 GET SYSTEM SETTINGS ───────────────────────────────────────
+      if (path === "/api/system/settings" && method === "GET") {
+        try {
+          const result = await env.councils_db.prepare(
+            "SELECT mission as commonsPadlet FROM councils WHERE id = 'system'"
+          ).first();
+          
+          return json({ settings: result || { commonsPadlet: "" } });
+        } catch (err) {
+          return json({ error: "SETTINGS_FETCH_FAILED", details: err.message }, 500);
+        }
+      }
+
+      // ─── 4.6 SAVE SYSTEM SETTINGS ──────────────────────────────────────
+      if (path === "/api/system/settings" && method === "POST") {
+        try {
+          const { commonsPadlet } = await request.json();
+          
+          await env.councils_db.prepare(
+            "INSERT INTO councils (id, name, mission, updatedAt) VALUES ('system', 'System Settings', ?, CURRENT_TIMESTAMP) " +
+            "ON CONFLICT(id) DO UPDATE SET mission = excluded.mission, updatedAt = CURRENT_TIMESTAMP"
+          ).bind(commonsPadlet).run();
+
+          return json({ success: true });
+        } catch (err) {
+          return json({ error: "SETTINGS_SAVE_FAILED", details: err.message }, 500);
         }
       }
 
@@ -187,7 +432,7 @@ export default {
       if (path === "/api/council/save" && method === "POST") {
         try {
           const body = await request.json();
-          const { id, name, mission, achievement, homepage, color, googleEmail, info } = body;
+          const { id, name, mission, achievement, homepage, color, googleEmail, info, padlets, mainProjectTitle, mainProjectProgress, mainProjectStatus } = body;
 
           // Extract values from either top-level or info wrapper
           const councilName = name || info?.name || '';
@@ -196,15 +441,97 @@ export default {
           const councilHomepage = homepage || info?.homepage || '';
           const councilColor = color || info?.color || '';
           const councilEmail = googleEmail || info?.googleEmail || '';
+          
+          const title = mainProjectTitle || info?.mainProjectTitle || '';
+          const progress = mainProjectProgress ?? info?.mainProjectProgress ?? 0;
+          const projStatus = mainProjectStatus || info?.mainProjectStatus || 'Not Started';
 
           await env.councils_db.prepare(
             "INSERT INTO councils (id, name, color, googleEmail, mission, achievement, homepage, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
             "ON CONFLICT(id) DO UPDATE SET name = excluded.name, mission = excluded.mission, achievement = excluded.achievement, homepage = excluded.homepage, color = excluded.color, googleEmail = excluded.googleEmail, updatedAt = CURRENT_TIMESTAMP"
           ).bind(id, councilName, councilColor, councilEmail, councilMission, councilAchievement, councilHomepage).run();
 
+          // Save Main Project
+          if (title && title.trim() !== '') {
+            // Delete existing main project for council (we only store 1 per council for now)
+            await env.resources_db.prepare("DELETE FROM projects WHERE councilId = ?").bind(id).run();
+            // Insert the new one
+            await env.resources_db.prepare(
+              "INSERT INTO projects (councilId, title, progress, status, updatedAt) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)"
+            ).bind(id, title, progress, projStatus).run();
+          }
+
+          if (padlets) {
+            const stmts = Object.entries(padlets).map(([type, url]) => {
+              if (url && url.trim() !== '') {
+                return env.resources_db.prepare(
+                  "INSERT INTO padlets (councilId, padletType, url, updatedAt) VALUES (?, ?, ?, CURRENT_TIMESTAMP) " +
+                  "ON CONFLICT(councilId, padletType) DO UPDATE SET url = excluded.url, updatedAt = CURRENT_TIMESTAMP"
+                ).bind(id, type, url);
+              } else {
+                return env.resources_db.prepare(
+                  "DELETE FROM padlets WHERE councilId = ? AND padletType = ?"
+                ).bind(id, type);
+              }
+            });
+            if (stmts.length > 0) {
+              await env.resources_db.batch(stmts);
+            }
+          }
+
           return json({ success: true });
         } catch (err) {
           return json({ error: "SERVER_ERROR", msg: err.message }, 500);
+        }
+      }
+
+      // ─── X. GET/SAVE PADLETS ENDPOINT (PadletSection.jsx) ───────────────
+      const padletMatch = path.match(/^\/api\/councils\/([^/]+)\/padlets$/);
+      if (padletMatch) {
+        const councilId = padletMatch[1];
+        
+        if (method === "GET") {
+          try {
+            const padletResults = await env.resources_db.prepare(
+              "SELECT padletType, url FROM padlets WHERE councilId = ?"
+            ).bind(councilId).all();
+
+            const padlets = {};
+            if (padletResults?.results) {
+              padletResults.results.forEach(p => {
+                padlets[p.padletType] = p.url;
+              });
+            }
+            return json({ padlets });
+          } catch (err) {
+            return json({ error: "FETCH_FAILED", details: err.message }, 500);
+          }
+        }
+        
+        if (method === "POST") {
+          try {
+            const { padlets } = await request.json();
+            if (padlets) {
+              const stmts = Object.entries(padlets).map(([type, url]) => {
+                if (url && url.trim() !== '') {
+                  return env.resources_db.prepare(
+                    "INSERT INTO padlets (councilId, padletType, url, updatedAt) VALUES (?, ?, ?, CURRENT_TIMESTAMP) " +
+                    "ON CONFLICT(councilId, padletType) DO UPDATE SET url = excluded.url, updatedAt = CURRENT_TIMESTAMP"
+                  ).bind(councilId, type, url);
+                } else {
+                   return env.resources_db.prepare(
+                    "DELETE FROM padlets WHERE councilId = ? AND padletType = ?"
+                  ).bind(councilId, type);
+                }
+              });
+              if (stmts.length > 0) {
+                await env.resources_db.batch(stmts);
+              }
+            }
+            return json({ success: true });
+          } catch (err) {
+            return json({ error: "SAVE_FAILED", details: err.message }, 500);
+          }
         }
       }
 
@@ -213,19 +540,28 @@ export default {
         try {
           const { councilId, credentials } = await request.json();
 
+          // Ensure council exists in the councils table (prevent FK constraint error)
+          await env.councils_db.prepare(
+            "INSERT OR IGNORE INTO councils (id, name, createdAt, updatedAt) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+          ).bind(councilId, councilId.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')).run();
+
           // Clear existing credentials for this council
           await env.councils_db.prepare(
             "DELETE FROM credentials WHERE councilId = ?"
           ).bind(councilId).run();
 
-          // Insert new credentials
-          const statements = Object.entries(credentials).map(([key, cred]) => {
-            return env.councils_db.prepare(
-              "INSERT INTO credentials (councilId, username, password, name, role, createdAt) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)"
-            ).bind(councilId, cred.username, cred.password, cred.name, cred.role);
-          });
+          // Filter out entries with empty usernames to avoid UNIQUE constraint errors
+          const validEntries = Object.entries(credentials).filter(
+            ([, cred]) => cred.username && cred.username.trim() !== ''
+          );
 
-          if (statements.length > 0) {
+          if (validEntries.length > 0) {
+            // Use INSERT OR IGNORE to gracefully handle any remaining duplicates
+            const statements = validEntries.map(([key, cred]) => {
+              return env.councils_db.prepare(
+                "INSERT OR IGNORE INTO credentials (councilId, username, password, name, role, createdAt) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)"
+              ).bind(councilId, cred.username.trim(), cred.password || '', cred.name || '', cred.role || 'Council Junior');
+            });
             await env.councils_db.batch(statements);
           }
 
@@ -263,12 +599,12 @@ export default {
       // ─── 8. SAVE INITIATIVE ─────────────────────────────────────────────
       if (path === "/api/initiatives/save" && method === "POST") {
         try {
-          const { councilId, id, title, description, objectives, expectedOutcomes, initiativeType, executionDate, status } = await request.json();
+          const { councilId, id, title, description, objectives, expectedOutcomes, initiativeType, executionDate, status, isSuccessful, successVisible } = await request.json();
 
           await env.initiatives_db.prepare(
-            "INSERT INTO initiatives (id, councilId, title, description, objectives, expectedOutcomes, initiativeType, executionDate, status, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
-            "ON CONFLICT(id) DO UPDATE SET title = excluded.title, description = excluded.description, objectives = excluded.objectives, expectedOutcomes = excluded.expectedOutcomes, initiativeType = excluded.initiativeType, executionDate = excluded.executionDate, status = excluded.status, updatedAt = CURRENT_TIMESTAMP"
-          ).bind(id, councilId, title, description, objectives, expectedOutcomes, initiativeType, executionDate, status || 'pending').run();
+            "INSERT INTO initiatives (id, councilId, title, description, objectives, expectedOutcomes, initiativeType, executionDate, status, isSuccessful, successVisible, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
+            "ON CONFLICT(id) DO UPDATE SET title = excluded.title, description = excluded.description, objectives = excluded.objectives, expectedOutcomes = excluded.expectedOutcomes, initiativeType = excluded.initiativeType, executionDate = excluded.executionDate, status = excluded.status, isSuccessful = excluded.isSuccessful, successVisible = excluded.successVisible, updatedAt = CURRENT_TIMESTAMP"
+          ).bind(id, councilId, title, description, objectives, expectedOutcomes, initiativeType, executionDate, status || 'pending', isSuccessful ? 1 : 0, successVisible ? 1 : 0).run();
 
           return json({ success: true });
         } catch (err) {
@@ -323,13 +659,32 @@ export default {
         try {
           const { councilId, initiativeId, comment } = await request.json();
 
+          // comment is either string or object { text, author }
+          const commentText = typeof comment === 'string' ? comment : comment.text;
+          const author = typeof comment === 'string' ? 'Manager' : (comment.author || 'Manager');
+
           await env.initiatives_db.prepare(
-            "INSERT INTO manager_comments (initiativeId, comment, createdAt) VALUES (?, ?, CURRENT_TIMESTAMP)"
-          ).bind(initiativeId, comment).run();
+            "INSERT INTO manager_comments (initiativeId, comment, createdBy, createdAt) VALUES (?, ?, ?, CURRENT_TIMESTAMP)"
+          ).bind(initiativeId, commentText, author).run();
 
           return json({ success: true });
         } catch (err) {
           return json({ error: "COMMENT_FAILED", details: err.message }, 500);
+        }
+      }
+
+      // ─── 11.5 DELETE COMMENT ──────────────────────────────────────────────
+      if (path === "/api/initiatives/comment/delete" && method === "POST") {
+        try {
+          const { commentId } = await request.json();
+
+          await env.initiatives_db.prepare(
+            "DELETE FROM manager_comments WHERE id = ?"
+          ).bind(commentId).run();
+
+          return json({ success: true });
+        } catch (err) {
+          return json({ error: "DELETE_COMMENT_FAILED", details: err.message }, 500);
         }
       }
 
@@ -395,12 +750,49 @@ export default {
           await env.resources_db.prepare("DELETE FROM padlets").run();
           await env.resources_db.prepare("DELETE FROM projects").run();
           await env.resources_db.prepare("DELETE FROM documents").run();
+          await env.resources_db.prepare("DELETE FROM strategic_analysis").run();
+          await env.resources_db.prepare("DELETE FROM timeline_events").run();
 
           return json({ success: true, message: "System wiped successfully" });
         } catch (err) {
-          return json({ error: "WIPE_FAILED", message: err.message }, 500);
+          return json({ error: "WIPE_FAILED", details: err.message }, 500);
         }
       }
+
+      // ─── 15. SAVE STRATEGIC ANALYSIS ──────────────────────────────────────
+      if (path === "/api/council/analysis/save" && method === "POST") {
+        try {
+          const { councilId, summary, strengths, risks, focus } = await request.json();
+          await env.resources_db.prepare(
+            "INSERT INTO strategic_analysis (councilId, summary, strengths, risks, focus, updatedAt) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
+            "ON CONFLICT(councilId) DO UPDATE SET summary=excluded.summary, strengths=excluded.strengths, risks=excluded.risks, focus=excluded.focus, updatedAt=excluded.updatedAt"
+          ).bind(councilId, summary, JSON.stringify(strengths), JSON.stringify(risks), JSON.stringify(focus)).run();
+          return json({ success: true });
+        } catch (err) {
+          return json({ error: "SAVE_ANALYSIS_FAILED", details: err.message }, 500);
+        }
+      }
+
+      // ─── 16. SAVE TIMELINE EVENTS ─────────────────────────────────────────
+      if (path === "/api/council/timeline/save" && method === "POST") {
+        try {
+          const { councilId, events } = await request.json();
+          // Clear and replace
+          await env.resources_db.prepare("DELETE FROM timeline_events WHERE councilId = ?").bind(councilId).run();
+          const statements = events.map(ev => {
+            return env.resources_db.prepare(
+              "INSERT INTO timeline_events (councilId, eventDate, title, note) VALUES (?, ?, ?, ?)"
+            ).bind(councilId, ev.date, ev.title, ev.note);
+          });
+          if (statements.length > 0) {
+            await env.resources_db.batch(statements);
+          }
+          return json({ success: true });
+        } catch (err) {
+          return json({ error: "SAVE_TIMELINE_FAILED", details: err.message }, 500);
+        }
+      }
+
 
       return json({ error: "NOT_FOUND" }, 404);
     } catch (err) {
