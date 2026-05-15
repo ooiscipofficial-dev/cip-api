@@ -12,6 +12,13 @@ CREATE TABLE initiatives (
   status TEXT DEFAULT 'pending',
   isSuccessful BOOLEAN DEFAULT 0,
   successVisible BOOLEAN DEFAULT 0,
+  executedOnTime BOOLEAN DEFAULT NULL,
+  successNote TEXT,
+  completedAt DATETIME,
+  completedBy TEXT,
+  managerNote TEXT,
+  reviewedBy TEXT,
+  dateReviewed TEXT,
   createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
   updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
 );

@@ -6,7 +6,7 @@
 const corsHeaders = () => ({
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
 });
 
 function isTruthyFlag(value) {
@@ -19,9 +19,9 @@ function clampScore(value, min = 0, max = 100) {
 
 function calculateImpactScore(data = {}) {
   const initiatives = data.initiatives || [];
-  const approved = data.approvedList || data.approved || initiatives.filter(i => i.status === "approved");
+  const approved = data.approvedList || data.approved || initiatives.filter(i => String(i.status || "").toLowerCase() === "approved");
   const successful = data.successfulInitiatives || initiatives.filter(i => isTruthyFlag(i.isSuccessful));
-  const rejected = data.rejectedList || data.rejected || initiatives.filter(i => i.status === "rejected");
+  const rejected = data.rejectedList || data.rejected || initiatives.filter(i => String(i.status || "").toLowerCase() === "rejected");
   const rawBase = Number(data.baseScore ?? data.info?.baseScore ?? 0);
   const base = Number.isFinite(rawBase) ? clampScore(rawBase, 0, 50) : 0;
 
@@ -41,6 +41,50 @@ function calculateImpactScore(data = {}) {
   const score = base + activity + approval + execution - rejectionPenalty - overdue - inactivity;
 
   return clampScore(Math.round(score));
+}
+
+const INITIATIVE_AUDIT_COLUMNS = {
+  executedOnTime: "INTEGER",
+  successNote: "TEXT",
+  completedAt: "DATETIME",
+  completedBy: "TEXT",
+  managerNote: "TEXT",
+  reviewedBy: "TEXT",
+  dateReviewed: "TEXT",
+};
+
+let initiativeAuditColumnsReady = false;
+
+async function ensureInitiativeAuditColumns(env) {
+  if (initiativeAuditColumnsReady) return;
+
+  const { results = [] } = await env.initiatives_db.prepare("PRAGMA table_info(initiatives)").all();
+  const existing = new Set(results.map(column => column.name));
+
+  for (const [column, type] of Object.entries(INITIATIVE_AUDIT_COLUMNS)) {
+    if (!existing.has(column)) {
+      await env.initiatives_db.prepare(`ALTER TABLE initiatives ADD COLUMN ${column} ${type}`).run();
+    }
+  }
+
+  initiativeAuditColumnsReady = true;
+}
+
+function normalizeReviewData(reviewData) {
+  if (typeof reviewData === "string") {
+    return { note: reviewData, name: "Manager" };
+  }
+
+  return {
+    note: reviewData?.note || reviewData?.text || reviewData?.reason || "",
+    name: reviewData?.name || reviewData?.author || "Manager",
+  };
+}
+
+function isManagerRequest(request) {
+  const auth = request.headers.get("Authorization") || "";
+  const token = auth.replace(/^Bearer\s+/i, "").trim();
+  return token.startsWith("mng_");
 }
 
 export default {
@@ -67,7 +111,7 @@ export default {
 
         // Query councils_db for credentials
         const credResult = await env.councils_db.prepare(
-          "SELECT id FROM credentials WHERE councilId = ? AND username = ? AND password = ?"
+          "SELECT id, name, role FROM credentials WHERE councilId = ? AND username = ? AND password = ?"
         ).bind(targetId, username, password).first();
 
         if (!credResult) {
@@ -88,8 +132,8 @@ export default {
           session: {
             type: 'member',
             username,
-            name: username,
-            role: 'member',
+            name: credResult.name || username,
+            role: credResult.role || 'member',
             councilId: targetId
           }
         });
@@ -136,7 +180,6 @@ export default {
           const { results: allProjects } = await env.resources_db.prepare("SELECT * FROM projects").all();
           const { results: allAnalysis } = await env.resources_db.prepare("SELECT * FROM strategic_analysis").all();
           const { results: allTimelineEvents } = await env.resources_db.prepare("SELECT * FROM timeline_events ORDER BY eventDate ASC").all();
-
           const fullData = {};
 
           for (const c of councils) {
@@ -145,14 +188,15 @@ export default {
             
             // Hydrate initiatives
             for (let init of initiatives) {
+              const status = String(init.status || "").toLowerCase();
               init.managerComments = allComments.filter(cm => cm.initiativeId === init.id);
               init.lead = allLeads.find(l => l.initiativeId === init.id) || { name: "Pending", role: "Initiative Lead" };
               init.contributors = allContributors.filter(con => con.initiativeId === init.id);
               init.progressReports = allReports.filter(r => r.initiativeId === init.id);
               init.execution = [
                 { phase: "Planning", note: "Strategy and resource mapping.", status: "Completed" },
-                { phase: "Execution", note: "Active deployment.", status: init.status === 'approved' ? 'Completed' : 'In Progress' },
-                { phase: "Feedback", note: "Outcome assessment.", status: init.status === 'approved' ? 'Completed' : 'Not Started' }
+                { phase: "Execution", note: "Active deployment.", status: status === 'approved' ? 'Completed' : 'In Progress' },
+                { phase: "Feedback", note: "Outcome assessment.", status: status === 'approved' ? 'Completed' : 'Not Started' }
               ];
               init.summary = init.description || "Council-led initiative.";
             }
@@ -164,16 +208,18 @@ export default {
               date: i.executionDate || i.createdAt,
               title: i.title,
               status: i.status,
+              type: isTruthyFlag(i.isSuccessful) ? "Completed" : String(i.status || "").toLowerCase() === "approved" ? "Approved" : "Pending",
               initiativeId: i.id
             }));
             const successfulInitiatives = initiatives.filter(i => isTruthyFlag(i.isSuccessful));
+
             const councilRecord = {
               id: id,
               info: { ...c },
               initiatives,
-              pendingList: initiatives.filter(i => i.status === 'pending'),
-              approvedList: initiatives.filter(i => i.status === 'approved'),
-              rejectedList: initiatives.filter(i => i.status === 'rejected'),
+              pendingList: initiatives.filter(i => String(i.status || "").toLowerCase() === 'pending'),
+              approvedList: initiatives.filter(i => String(i.status || "").toLowerCase() === 'approved'),
+              rejectedList: initiatives.filter(i => String(i.status || "").toLowerCase() === 'rejected'),
               successfulInitiatives,
               mainProject: allProjects.find(p => p.councilId === id) || { title: "", progress: 0, status: "Not Started" },
               padlets,
@@ -276,6 +322,7 @@ export default {
           ).bind(id).all();
 
           for (let init of initiatives) {
+            const status = String(init.status || "").toLowerCase();
             init.managerComments = allComments.filter(c => c.initiativeId === init.id);
             init.lead = allLeads.find(l => l.initiativeId === init.id) || { name: "Pending", role: "Initiative Lead" };
             init.contributors = allContributors.filter(c => c.initiativeId === init.id);
@@ -284,15 +331,15 @@ export default {
             // Format for frontend expectations
             init.execution = [
               { phase: "Planning", note: "Strategy and resource mapping.", status: "Completed" },
-              { phase: "Execution", note: "Active deployment and student engagement.", status: init.status === 'approved' ? 'Completed' : 'In Progress' },
-              { phase: "Feedback", note: "Outcome assessment and teacher review.", status: init.status === 'approved' ? 'Completed' : 'Not Started' }
+              { phase: "Execution", note: "Active deployment and student engagement.", status: status === 'approved' ? 'Completed' : 'In Progress' },
+              { phase: "Feedback", note: "Outcome assessment and teacher review.", status: status === 'approved' ? 'Completed' : 'Not Started' }
             ];
             init.summary = init.description || "Council-led initiative focused on community impact and platform innovation.";
           }
 
-          const pendingList = initiatives.filter(i => i.status === 'pending');
-          const approvedList = initiatives.filter(i => i.status === 'approved');
-          const rejectedList = initiatives.filter(i => i.status === 'rejected');
+          const pendingList = initiatives.filter(i => String(i.status || "").toLowerCase() === 'pending');
+          const approvedList = initiatives.filter(i => String(i.status || "").toLowerCase() === 'approved');
+          const rejectedList = initiatives.filter(i => String(i.status || "").toLowerCase() === 'rejected');
           const successfulInitiatives = initiatives.filter(i => isTruthyFlag(i.isSuccessful));
 
           // Get padlets from resources_db
@@ -314,28 +361,6 @@ export default {
 
           const mainProject = projectResult || { title: "", progress: 0, status: "Not Started" };
 
-          // Get credentials from councils_db
-          const credsResult = await env.councils_db.prepare(
-            "SELECT username, password, name, role FROM credentials WHERE councilId = ?"
-          ).bind(id).all();
-
-          const credentials = {};
-          if (credsResult?.results) {
-            credsResult.results.forEach((c, i) => {
-              credentials[`member_${i}`] = { 
-                username: c.username, 
-                password: c.password, 
-                name: c.name, 
-                role: c.role 
-              };
-            });
-            // Try to set admin in 'username' key to match legacy frontend format
-            const admin = credsResult.results.find(c => c.role === 'Council Lead' || c.username === 'admin');
-            if (admin) {
-              credentials['username'] = admin;
-            }
-          }
-
           // Get strategic analysis from resources_db
           const analysis = await env.resources_db.prepare(
             "SELECT summary, strengths, risks, focus FROM strategic_analysis WHERE councilId = ?"
@@ -350,7 +375,7 @@ export default {
             date: i.executionDate || i.createdAt,
             title: i.title,
             description: i.description || "Active initiative from council operations.",
-            type: i.status === "approved" ? "Completed" : "Pending",
+            type: isTruthyFlag(i.isSuccessful) ? "Completed" : String(i.status || "").toLowerCase() === "approved" ? "Approved" : "Pending",
             status: i.status,
             initiativeId: i.id
           }));
@@ -383,7 +408,6 @@ export default {
             rejectedList,
             mainProject,
             padlets,
-            credentials,
             successfulInitiatives,
             calendarEvents,
             strategicAnalysis: analysis || { 
@@ -536,8 +560,44 @@ export default {
       }
 
       // ─── 6. SAVE CREDENTIALS ────────────────────────────────────────────
+      if (path === "/api/credentials/list" && method === "GET") {
+        try {
+          if (!isManagerRequest(request)) {
+            return json({ error: "UNAUTHORIZED" }, 401);
+          }
+
+          const councilId = url.searchParams.get("councilId");
+          if (!councilId) {
+            return json({ error: "MISSING_COUNCIL_ID" }, 400);
+          }
+
+          const credsResult = await env.councils_db.prepare(
+            "SELECT id, username, password, name, role FROM credentials WHERE councilId = ? ORDER BY id ASC"
+          ).bind(councilId).all();
+
+          const credentials = {};
+          (credsResult?.results || []).forEach((cred) => {
+            credentials[`credential_${cred.id}`] = {
+              id: cred.id,
+              username: cred.username,
+              password: cred.password,
+              name: cred.name,
+              role: cred.role
+            };
+          });
+
+          return json({ credentials });
+        } catch (err) {
+          return json({ error: "CREDENTIALS_FETCH_FAILED", details: err.message }, 500);
+        }
+      }
+
       if (path === "/api/credentials/save" && method === "POST") {
         try {
+          if (!isManagerRequest(request)) {
+            return json({ error: "UNAUTHORIZED" }, 401);
+          }
+
           const { councilId, credentials } = await request.json();
 
           // Ensure council exists in the councils table (prevent FK constraint error)
@@ -599,12 +659,51 @@ export default {
       // ─── 8. SAVE INITIATIVE ─────────────────────────────────────────────
       if (path === "/api/initiatives/save" && method === "POST") {
         try {
-          const { councilId, id, title, description, objectives, expectedOutcomes, initiativeType, executionDate, status, isSuccessful, successVisible } = await request.json();
+          await ensureInitiativeAuditColumns(env);
+          const {
+            councilId,
+            id,
+            title,
+            description,
+            objectives,
+            expectedOutcomes,
+            initiativeType,
+            executionDate,
+            status,
+            isSuccessful,
+            successVisible,
+            executedOnTime,
+            successNote,
+            completedAt,
+            completedBy,
+            managerNote,
+            reviewedBy,
+            dateReviewed
+          } = await request.json();
 
           await env.initiatives_db.prepare(
-            "INSERT INTO initiatives (id, councilId, title, description, objectives, expectedOutcomes, initiativeType, executionDate, status, isSuccessful, successVisible, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
-            "ON CONFLICT(id) DO UPDATE SET title = excluded.title, description = excluded.description, objectives = excluded.objectives, expectedOutcomes = excluded.expectedOutcomes, initiativeType = excluded.initiativeType, executionDate = excluded.executionDate, status = excluded.status, isSuccessful = excluded.isSuccessful, successVisible = excluded.successVisible, updatedAt = CURRENT_TIMESTAMP"
-          ).bind(id, councilId, title, description, objectives, expectedOutcomes, initiativeType, executionDate, status || 'pending', isSuccessful ? 1 : 0, successVisible ? 1 : 0).run();
+            "INSERT INTO initiatives (id, councilId, title, description, objectives, expectedOutcomes, initiativeType, executionDate, status, isSuccessful, successVisible, executedOnTime, successNote, completedAt, completedBy, managerNote, reviewedBy, dateReviewed, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
+            "ON CONFLICT(id) DO UPDATE SET title = excluded.title, description = excluded.description, objectives = excluded.objectives, expectedOutcomes = excluded.expectedOutcomes, initiativeType = excluded.initiativeType, executionDate = excluded.executionDate, status = excluded.status, isSuccessful = excluded.isSuccessful, successVisible = excluded.successVisible, executedOnTime = excluded.executedOnTime, successNote = excluded.successNote, completedAt = excluded.completedAt, completedBy = excluded.completedBy, managerNote = excluded.managerNote, reviewedBy = excluded.reviewedBy, dateReviewed = excluded.dateReviewed, updatedAt = CURRENT_TIMESTAMP"
+          ).bind(
+            id,
+            councilId,
+            title,
+            description,
+            objectives,
+            expectedOutcomes,
+            initiativeType,
+            executionDate,
+            String(status || 'pending').toLowerCase(),
+            isTruthyFlag(isSuccessful) ? 1 : 0,
+            isTruthyFlag(successVisible) ? 1 : 0,
+            executedOnTime == null ? null : (isTruthyFlag(executedOnTime) ? 1 : 0),
+            successNote || '',
+            completedAt || null,
+            completedBy || null,
+            managerNote || null,
+            reviewedBy || null,
+            dateReviewed || null
+          ).run();
 
           return json({ success: true });
         } catch (err) {
@@ -615,17 +714,27 @@ export default {
       // ─── 9. APPROVE INITIATIVE ──────────────────────────────────────────
       if (path === "/api/initiatives/approve" && method === "POST") {
         try {
+          await ensureInitiativeAuditColumns(env);
           const { councilId, initiativeId, reviewData } = await request.json();
+          const { note, name } = normalizeReviewData(reviewData);
+
+          const existing = await env.initiatives_db.prepare(
+            "SELECT status FROM initiatives WHERE id = ? AND councilId = ?"
+          ).bind(initiativeId, councilId).first();
+
+          if (!existing) {
+            return json({ error: "INITIATIVE_NOT_FOUND" }, 404);
+          }
 
           // Update initiative status
           await env.initiatives_db.prepare(
-            "UPDATE initiatives SET status = 'approved', updatedAt = CURRENT_TIMESTAMP WHERE id = ?"
-          ).bind(initiativeId).run();
+            "UPDATE initiatives SET status = 'approved', managerNote = ?, reviewedBy = ?, dateReviewed = ?, updatedAt = CURRENT_TIMESTAMP WHERE id = ? AND councilId = ?"
+          ).bind(note, name, new Date().toISOString().split("T")[0], initiativeId, councilId).run();
 
           // Log status change
           await env.initiatives_db.prepare(
-            "INSERT INTO initiative_status_history (initiativeId, oldStatus, newStatus, changedAt) VALUES (?, 'pending', 'approved', CURRENT_TIMESTAMP)"
-          ).bind(initiativeId).run();
+            "INSERT INTO initiative_status_history (initiativeId, oldStatus, newStatus, changedBy, reason, changedAt) VALUES (?, ?, 'approved', ?, ?, CURRENT_TIMESTAMP)"
+          ).bind(initiativeId, existing.status || 'pending', name, note).run();
 
           return json({ success: true });
         } catch (err) {
@@ -636,17 +745,27 @@ export default {
       // ─── 10. REJECT INITIATIVE ──────────────────────────────────────────
       if (path === "/api/initiatives/reject" && method === "POST") {
         try {
+          await ensureInitiativeAuditColumns(env);
           const { councilId, initiativeId, reason } = await request.json();
+          const { note, name } = normalizeReviewData(reason);
+
+          const existing = await env.initiatives_db.prepare(
+            "SELECT status FROM initiatives WHERE id = ? AND councilId = ?"
+          ).bind(initiativeId, councilId).first();
+
+          if (!existing) {
+            return json({ error: "INITIATIVE_NOT_FOUND" }, 404);
+          }
 
           // Update initiative status
           await env.initiatives_db.prepare(
-            "UPDATE initiatives SET status = 'rejected', updatedAt = CURRENT_TIMESTAMP WHERE id = ?"
-          ).bind(initiativeId).run();
+            "UPDATE initiatives SET status = 'rejected', isSuccessful = 0, successVisible = 0, managerNote = ?, reviewedBy = ?, dateReviewed = ?, updatedAt = CURRENT_TIMESTAMP WHERE id = ? AND councilId = ?"
+          ).bind(note, name, new Date().toISOString().split("T")[0], initiativeId, councilId).run();
 
           // Log status change
           await env.initiatives_db.prepare(
-            "INSERT INTO initiative_status_history (initiativeId, oldStatus, newStatus, reason, changedAt) VALUES (?, 'pending', 'rejected', ?, CURRENT_TIMESTAMP)"
-          ).bind(initiativeId, reason || '').run();
+            "INSERT INTO initiative_status_history (initiativeId, oldStatus, newStatus, changedBy, reason, changedAt) VALUES (?, ?, 'rejected', ?, ?, CURRENT_TIMESTAMP)"
+          ).bind(initiativeId, existing.status || 'pending', name, note).run();
 
           return json({ success: true });
         } catch (err) {
@@ -655,6 +774,41 @@ export default {
       }
 
       // ─── 11. ADD COMMENT ────────────────────────────────────────────────
+      if (path === "/api/initiatives/complete" && method === "POST") {
+        try {
+          await ensureInitiativeAuditColumns(env);
+          const { councilId, initiativeId, executedOnTime, successNote, completedBy } = await request.json();
+
+          const initiative = await env.initiatives_db.prepare(
+            "SELECT * FROM initiatives WHERE id = ? AND councilId = ?"
+          ).bind(initiativeId, councilId).first();
+
+          if (!initiative) {
+            return json({ error: "INITIATIVE_NOT_FOUND" }, 404);
+          }
+
+          if (String(initiative.status || "").toLowerCase() !== "approved") {
+            return json({ error: "Only manager-approved initiatives can be marked completed" }, 409);
+          }
+
+          await env.initiatives_db.prepare(
+            "UPDATE initiatives SET isSuccessful = 1, successVisible = 1, executedOnTime = ?, successNote = ?, completedAt = CURRENT_TIMESTAMP, completedBy = ?, updatedAt = CURRENT_TIMESTAMP WHERE id = ? AND councilId = ?"
+          ).bind(executedOnTime ? 1 : 0, successNote || "", completedBy || "President", initiativeId, councilId).run();
+
+          await env.initiatives_db.prepare(
+            "INSERT INTO initiative_status_history (initiativeId, oldStatus, newStatus, changedBy, reason, changedAt) VALUES (?, 'approved', 'completed', ?, ?, CURRENT_TIMESTAMP)"
+          ).bind(initiativeId, completedBy || "President", successNote || "").run();
+
+          const updated = await env.initiatives_db.prepare(
+            "SELECT * FROM initiatives WHERE id = ? AND councilId = ?"
+          ).bind(initiativeId, councilId).first();
+
+          return json({ success: true, initiative: updated });
+        } catch (err) {
+          return json({ error: "COMPLETE_FAILED", details: err.message }, 500);
+        }
+      }
+
       if (path === "/api/initiatives/comment" && method === "POST") {
         try {
           const { councilId, initiativeId, comment } = await request.json();
