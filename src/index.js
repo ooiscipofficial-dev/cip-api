@@ -54,6 +54,7 @@ const INITIATIVE_AUDIT_COLUMNS = {
 };
 
 let initiativeAuditColumnsReady = false;
+let initiativePeopleSchemaReady = false;
 
 async function ensureInitiativeAuditColumns(env) {
   if (initiativeAuditColumnsReady) return;
@@ -68,6 +69,51 @@ async function ensureInitiativeAuditColumns(env) {
   }
 
   initiativeAuditColumnsReady = true;
+}
+
+async function ensureInitiativePeopleSchema(env) {
+  if (initiativePeopleSchemaReady) return;
+
+  const leadColumns = {
+    type: "TEXT",
+    councilName: "TEXT",
+    class: "TEXT",
+    section: "TEXT",
+    imageUrl: "TEXT",
+  };
+  const contributorColumns = {
+    role: "TEXT",
+    class: "TEXT",
+    section: "TEXT",
+    imageUrl: "TEXT",
+  };
+
+  const { results: leadInfo = [] } = await env.initiatives_db.prepare("PRAGMA table_info(initiative_leads)").all();
+  const existingLeadColumns = new Set(leadInfo.map(column => column.name));
+  for (const [column, type] of Object.entries(leadColumns)) {
+    if (!existingLeadColumns.has(column)) {
+      await env.initiatives_db.prepare(`ALTER TABLE initiative_leads ADD COLUMN ${column} ${type}`).run();
+    }
+  }
+
+  const { results: contributorInfo = [] } = await env.initiatives_db.prepare("PRAGMA table_info(initiative_contributors)").all();
+  const existingContributorColumns = new Set(contributorInfo.map(column => column.name));
+  for (const [column, type] of Object.entries(contributorColumns)) {
+    if (!existingContributorColumns.has(column)) {
+      await env.initiatives_db.prepare(`ALTER TABLE initiative_contributors ADD COLUMN ${column} ${type}`).run();
+    }
+  }
+
+  await env.initiatives_db.prepare(
+    "CREATE TABLE IF NOT EXISTS initiative_lead_students (" +
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+    "initiativeId TEXT NOT NULL, " +
+    "name TEXT, role TEXT, class TEXT, section TEXT, imageUrl TEXT, " +
+    "createdAt DATETIME DEFAULT CURRENT_TIMESTAMP, " +
+    "FOREIGN KEY (initiativeId) REFERENCES initiatives(id) ON DELETE CASCADE)"
+  ).run();
+
+  initiativePeopleSchemaReady = true;
 }
 
 function normalizeReviewData(reviewData) {
@@ -173,7 +219,9 @@ export default {
           // 2. Fetch all related data in BULK (minimizing D1 roundtrips)
           const { results: allInitiatives } = await env.initiatives_db.prepare("SELECT * FROM initiatives").all();
           const { results: allComments } = await env.initiatives_db.prepare("SELECT * FROM manager_comments").all();
+          await ensureInitiativePeopleSchema(env);
           const { results: allLeads } = await env.initiatives_db.prepare("SELECT * FROM initiative_leads").all();
+          const { results: allLeadStudents } = await env.initiatives_db.prepare("SELECT * FROM initiative_lead_students").all();
           const { results: allContributors } = await env.initiatives_db.prepare("SELECT * FROM initiative_contributors").all();
           const { results: allReports } = await env.initiatives_db.prepare("SELECT * FROM progress_reports").all();
           const { results: allPadlets } = await env.resources_db.prepare("SELECT * FROM padlets").all();
@@ -190,7 +238,9 @@ export default {
             for (let init of initiatives) {
               const status = String(init.status || "").toLowerCase();
               init.managerComments = allComments.filter(cm => cm.initiativeId === init.id);
-              init.lead = allLeads.find(l => l.initiativeId === init.id) || { name: "Pending", role: "Initiative Lead" };
+              init.lead = allLeads.find(l => l.initiativeId === init.id) || { type: "individual", name: "Pending", role: "Initiative Lead" };
+              init.lead.type = init.lead.type || "individual";
+              init.lead.mainStudents = allLeadStudents.filter(student => student.initiativeId === init.id);
               init.contributors = allContributors.filter(con => con.initiativeId === init.id);
               init.progressReports = allReports.filter(r => r.initiativeId === init.id);
               init.execution = [
@@ -306,9 +356,15 @@ export default {
           
           const allComments = commentsResult?.results || [];
           
+          await ensureInitiativePeopleSchema(env);
+
           // Get leads for all initiatives of this council
           const { results: allLeads } = await env.initiatives_db.prepare(
             "SELECT il.* FROM initiative_leads il JOIN initiatives i ON il.initiativeId = i.id WHERE i.councilId = ?"
+          ).bind(id).all();
+
+          const { results: allLeadStudents } = await env.initiatives_db.prepare(
+            "SELECT ils.* FROM initiative_lead_students ils JOIN initiatives i ON ils.initiativeId = i.id WHERE i.councilId = ?"
           ).bind(id).all();
 
           // Get contributors for all initiatives of this council
@@ -324,7 +380,9 @@ export default {
           for (let init of initiatives) {
             const status = String(init.status || "").toLowerCase();
             init.managerComments = allComments.filter(c => c.initiativeId === init.id);
-            init.lead = allLeads.find(l => l.initiativeId === init.id) || { name: "Pending", role: "Initiative Lead" };
+            init.lead = allLeads.find(l => l.initiativeId === init.id) || { type: "individual", name: "Pending", role: "Initiative Lead" };
+            init.lead.type = init.lead.type || "individual";
+            init.lead.mainStudents = allLeadStudents.filter(student => student.initiativeId === init.id);
             init.contributors = allContributors.filter(c => c.initiativeId === init.id);
             init.progressReports = allReports.filter(r => r.initiativeId === init.id);
             
@@ -660,6 +718,7 @@ export default {
       if (path === "/api/initiatives/save" && method === "POST") {
         try {
           await ensureInitiativeAuditColumns(env);
+          await ensureInitiativePeopleSchema(env);
           const {
             councilId,
             id,
@@ -678,7 +737,9 @@ export default {
             completedBy,
             managerNote,
             reviewedBy,
-            dateReviewed
+            dateReviewed,
+            lead,
+            contributors = []
           } = await request.json();
 
           await env.initiatives_db.prepare(
@@ -704,6 +765,47 @@ export default {
             reviewedBy || null,
             dateReviewed || null
           ).run();
+
+          await env.initiatives_db.batch([
+            env.initiatives_db.prepare("DELETE FROM initiative_leads WHERE initiativeId = ?").bind(id),
+            env.initiatives_db.prepare("DELETE FROM initiative_lead_students WHERE initiativeId = ?").bind(id),
+            env.initiatives_db.prepare("DELETE FROM initiative_contributors WHERE initiativeId = ?").bind(id),
+          ]);
+
+          const normalizedLead = lead || {};
+          if (normalizedLead.name || normalizedLead.councilName || normalizedLead.type === "council") {
+            await env.initiatives_db.prepare(
+              "INSERT INTO initiative_leads (initiativeId, name, role, type, councilName, class, section, imageUrl) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            ).bind(
+              id,
+              normalizedLead.name || "",
+              normalizedLead.role || (normalizedLead.type === "council" ? "Council Initiative Lead" : "Initiative Lead"),
+              normalizedLead.type === "council" ? "council" : "individual",
+              normalizedLead.councilName || "",
+              normalizedLead.class || "",
+              normalizedLead.section || "",
+              normalizedLead.imageUrl || ""
+            ).run();
+          }
+
+          const leadStudents = Array.isArray(normalizedLead.mainStudents) ? normalizedLead.mainStudents : [];
+          const leadStudentStatements = leadStudents
+            .filter(student => student && student.name)
+            .map(student => env.initiatives_db.prepare(
+              "INSERT INTO initiative_lead_students (initiativeId, name, role, class, section, imageUrl) VALUES (?, ?, ?, ?, ?, ?)"
+            ).bind(id, student.name || "", student.role || "Main Student", student.class || "", student.section || "", student.imageUrl || ""));
+          if (leadStudentStatements.length) {
+            await env.initiatives_db.batch(leadStudentStatements);
+          }
+
+          const contributorStatements = (Array.isArray(contributors) ? contributors : [])
+            .filter(contributor => contributor && contributor.name)
+            .map(contributor => env.initiatives_db.prepare(
+              "INSERT INTO initiative_contributors (initiativeId, name, role, class, section, imageUrl) VALUES (?, ?, ?, ?, ?, ?)"
+            ).bind(id, contributor.name || "", contributor.role || "", contributor.class || "", contributor.section || "", contributor.imageUrl || ""));
+          if (contributorStatements.length) {
+            await env.initiatives_db.batch(contributorStatements);
+          }
 
           return json({ success: true });
         } catch (err) {
@@ -851,6 +953,8 @@ export default {
           await env.initiatives_db.prepare("DELETE FROM manager_comments WHERE initiativeId = ?").bind(initiativeId).run();
           await env.initiatives_db.prepare("DELETE FROM progress_reports WHERE initiativeId = ?").bind(initiativeId).run();
           await env.initiatives_db.prepare("DELETE FROM initiative_leads WHERE initiativeId = ?").bind(initiativeId).run();
+          await ensureInitiativePeopleSchema(env);
+          await env.initiatives_db.prepare("DELETE FROM initiative_lead_students WHERE initiativeId = ?").bind(initiativeId).run();
           await env.initiatives_db.prepare("DELETE FROM initiative_contributors WHERE initiativeId = ?").bind(initiativeId).run();
 
           // Delete the initiative
@@ -900,6 +1004,8 @@ export default {
           await env.initiatives_db.prepare("DELETE FROM manager_comments").run();
           await env.initiatives_db.prepare("DELETE FROM initiative_status_history").run();
           await env.initiatives_db.prepare("DELETE FROM initiative_leads").run();
+          await ensureInitiativePeopleSchema(env);
+          await env.initiatives_db.prepare("DELETE FROM initiative_lead_students").run();
           await env.initiatives_db.prepare("DELETE FROM initiative_contributors").run();
           await env.resources_db.prepare("DELETE FROM padlets").run();
           await env.resources_db.prepare("DELETE FROM projects").run();

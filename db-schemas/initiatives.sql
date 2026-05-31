@@ -26,8 +26,25 @@ CREATE TABLE initiatives (
 CREATE TABLE initiative_leads (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   initiativeId TEXT NOT NULL,
+  type TEXT DEFAULT 'individual',
+  councilName TEXT,
   name TEXT,
   role TEXT,
+  class TEXT,
+  section TEXT,
+  imageUrl TEXT,
+  createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (initiativeId) REFERENCES initiatives(id) ON DELETE CASCADE
+);
+
+CREATE TABLE initiative_lead_students (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  initiativeId TEXT NOT NULL,
+  name TEXT,
+  role TEXT,
+  class TEXT,
+  section TEXT,
+  imageUrl TEXT,
   createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (initiativeId) REFERENCES initiatives(id) ON DELETE CASCADE
 );
@@ -36,6 +53,10 @@ CREATE TABLE initiative_contributors (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   initiativeId TEXT NOT NULL,
   name TEXT,
+  role TEXT,
+  class TEXT,
+  section TEXT,
+  imageUrl TEXT,
   createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (initiativeId) REFERENCES initiatives(id) ON DELETE CASCADE
 );
