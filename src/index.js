@@ -134,6 +134,33 @@ function isManagerRequest(request) {
   return token.startsWith("mng_");
 }
 
+function initiativeFingerprint(initiative) {
+  return [
+    String(initiative.title || "").trim().toLowerCase(),
+    String(initiative.description || "").trim().toLowerCase(),
+    String(initiative.objectives || "").trim().toLowerCase(),
+    String(initiative.expectedOutcomes || "").trim().toLowerCase(),
+    String(initiative.initiativeType || "").trim().toLowerCase(),
+    String(initiative.executionDate || ""),
+    String(initiative.status || "pending").trim().toLowerCase()
+  ].join("|");
+}
+
+// Older versions of the client could submit a new form more than once before
+// the first request completed. Keep the most recently updated copy visible,
+// while preserving genuinely different initiatives.
+function deduplicateInitiatives(initiatives = []) {
+  const seen = new Set();
+  return [...initiatives]
+    .sort((a, b) => String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || "")))
+    .filter(initiative => {
+      const fingerprint = initiativeFingerprint(initiative);
+      if (seen.has(fingerprint)) return false;
+      seen.add(fingerprint);
+      return true;
+    });
+}
+
 async function ensureActivityAuditSchema(env) {
   await env.councils_db.prepare(
     "CREATE TABLE IF NOT EXISTS activity_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, councilId TEXT, initiativeId TEXT, actorName TEXT, actorUsername TEXT, actorType TEXT, action TEXT NOT NULL, activeSeconds INTEGER DEFAULT 0, createdAt DATETIME DEFAULT CURRENT_TIMESTAMP)"
@@ -179,6 +206,11 @@ export default {
         if (!council) {
           return json({ success: false, error: "Council not found" }, 404);
         }
+
+        await ensureActivityAuditSchema(env);
+        await env.councils_db.prepare(
+          "INSERT INTO activity_audit (councilId, actorName, actorUsername, actorType, action) VALUES (?, ?, ?, 'member', 'Logged in')"
+        ).bind(targetId, credResult.name || username, username).run();
 
         return json({
           success: true,
@@ -237,6 +269,19 @@ export default {
         } catch (err) { return json({ error: "ACTIVITY_LIST_FAILED", details: err.message }, 500); }
       }
 
+      if (path === "/api/activity/monthly" && method === "GET") {
+        try {
+          if (!isManagerRequest(request)) return json({ error: "UNAUTHORIZED" }, 401);
+          await ensureActivityAuditSchema(env);
+          const month = url.searchParams.get("month") || new Date().toISOString().slice(0, 7);
+          if (!/^\d{4}-\d{2}$/.test(month)) return json({ error: "INVALID_MONTH" }, 400);
+          const { results = [] } = await env.councils_db.prepare(
+            "SELECT * FROM activity_audit WHERE strftime('%Y-%m', createdAt) = ? ORDER BY createdAt DESC, id DESC"
+          ).bind(month).all();
+          return json({ activity: results });
+        } catch (err) { return json({ error: "ACTIVITY_MONTHLY_FAILED", details: err.message }, 500); }
+      }
+
       // ─── 4.0 SUPER-AGGREGATE: GET EVERYTHING FOR ALL COUNCILS ──────────
       // This endpoint replaces 14+ individual fetches with a single bulk query
       if (path.endsWith("/api/councils/full") || path.endsWith("/councils/full")) {
@@ -262,7 +307,7 @@ export default {
 
           for (const c of councils) {
             const id = c.id;
-            const initiatives = allInitiatives.filter(i => i.councilId === id);
+            const initiatives = deduplicateInitiatives(allInitiatives.filter(i => i.councilId === id));
             
             // Hydrate initiatives
             for (let init of initiatives) {
@@ -375,7 +420,7 @@ export default {
             "SELECT * FROM initiatives WHERE councilId = ? AND status IN ('approved', 'pending', 'rejected')"
           ).bind(id).all();
 
-          const initiatives = initiativesResult?.results || [];
+          const initiatives = deduplicateInitiatives(initiativesResult?.results || []);
 
           // Get manager comments
           const commentsResult = await env.initiatives_db.prepare(
