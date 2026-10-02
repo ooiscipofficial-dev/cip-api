@@ -167,6 +167,12 @@ async function ensureActivityAuditSchema(env) {
   ).run();
 }
 
+async function ensureDriveLinksSchema(env) {
+  await env.resources_db.prepare(
+    "CREATE TABLE IF NOT EXISTS drive_links (scope TEXT NOT NULL, councilId TEXT NOT NULL DEFAULT '', url TEXT NOT NULL, updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (scope, councilId))"
+  ).run();
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
@@ -280,6 +286,35 @@ export default {
           ).bind(month).all();
           return json({ activity: results });
         } catch (err) { return json({ error: "ACTIVITY_MONTHLY_FAILED", details: err.message }, 500); }
+      }
+
+      if (path === "/api/drive/link" && method === "GET") {
+        try {
+          await ensureDriveLinksSchema(env);
+          const scope = url.searchParams.get("scope") === "global" ? "global" : "council";
+          const councilId = scope === "global" ? "" : String(url.searchParams.get("councilId") || "").trim();
+          if (scope === "council" && !councilId) return json({ error: "MISSING_COUNCIL_ID" }, 400);
+          const link = await env.resources_db.prepare("SELECT url FROM drive_links WHERE scope = ? AND councilId = ?").bind(scope, councilId).first();
+          return json({ url: link?.url || "" });
+        } catch (err) { return json({ error: "DRIVE_LINK_FETCH_FAILED", details: err.message }, 500); }
+      }
+
+      if (path === "/api/drive/link" && method === "POST") {
+        try {
+          await ensureDriveLinksSchema(env);
+          const { scope: rawScope, councilId: rawCouncilId, url: driveUrl } = await readBody();
+          const scope = rawScope === "global" ? "global" : "council";
+          const councilId = scope === "global" ? "" : String(rawCouncilId || "").trim();
+          if (scope === "global" && !isManagerRequest(request)) return json({ error: "UNAUTHORIZED" }, 401);
+          if (scope === "council" && !councilId) return json({ error: "MISSING_COUNCIL_ID" }, 400);
+          let parsed;
+          try { parsed = new URL(String(driveUrl || "")); } catch { return json({ error: "INVALID_DRIVE_URL" }, 400); }
+          if (parsed.protocol !== "https:" || !/(^|\.)drive\.google\.com$/i.test(parsed.hostname)) return json({ error: "INVALID_DRIVE_URL" }, 400);
+          await env.resources_db.prepare(
+            "INSERT INTO drive_links (scope, councilId, url, updatedAt) VALUES (?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(scope, councilId) DO UPDATE SET url = excluded.url, updatedAt = CURRENT_TIMESTAMP"
+          ).bind(scope, councilId, parsed.toString()).run();
+          return json({ success: true, url: parsed.toString() });
+        } catch (err) { return json({ error: "DRIVE_LINK_SAVE_FAILED", details: err.message }, 500); }
       }
 
       // ─── 4.0 SUPER-AGGREGATE: GET EVERYTHING FOR ALL COUNCILS ──────────
