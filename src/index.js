@@ -55,6 +55,17 @@ const INITIATIVE_AUDIT_COLUMNS = {
   dateReviewed: "TEXT",
 };
 
+let councilFeedbackColumnReady = false;
+
+async function ensureCouncilFeedbackColumn(env) {
+  if (councilFeedbackColumnReady) return;
+  const { results = [] } = await env.councils_db.prepare("PRAGMA table_info(councils)").all();
+  if (!results.some(column => column.name === "feedbackFormUrl")) {
+    await env.councils_db.prepare("ALTER TABLE councils ADD COLUMN feedbackFormUrl TEXT DEFAULT ''").run();
+  }
+  councilFeedbackColumnReady = true;
+}
+
 let initiativeAuditColumnsReady = false;
 let initiativePeopleSchemaReady = false;
 
@@ -244,8 +255,9 @@ export default {
       // ─── 3. GET ALL COUNCILS (BASIC) ───────────────────────────────────
       if (path === "/api/councils/all" && method === "GET") {
         try {
+          await ensureCouncilFeedbackColumn(env);
           const { results } = await env.councils_db.prepare(
-            "SELECT id, name, color, googleEmail, mission, achievement, homepage FROM councils WHERE id != 'system'"
+            "SELECT id, name, color, googleEmail, mission, achievement, homepage, feedbackFormUrl FROM councils WHERE id != 'system'"
           ).all();
           return json(results.reduce((acc, row) => ({ ...acc, [row.id]: row }), {}));
         } catch (err) {
@@ -322,9 +334,10 @@ export default {
       // This endpoint replaces 14+ individual fetches with a single bulk query
       if (path.endsWith("/api/councils/full") || path.endsWith("/councils/full")) {
         try {
+          await ensureCouncilFeedbackColumn(env);
           // 1. Fetch all core councils
           const { results: councils } = await env.councils_db.prepare(
-            "SELECT id, name, color, googleEmail, mission, achievement, homepage FROM councils WHERE id != 'system'"
+            "SELECT id, name, color, googleEmail, mission, achievement, homepage, feedbackFormUrl FROM councils WHERE id != 'system'"
           ).all();
 
           // 2. Fetch all related data in BULK (minimizing D1 roundtrips)
@@ -432,8 +445,9 @@ export default {
         const id = url.searchParams.get("id");
 
         try {
+          await ensureCouncilFeedbackColumn(env);
           const council = await env.councils_db.prepare(
-            "SELECT id, name, color, googleEmail, mission, achievement, homepage FROM councils WHERE id = ?"
+            "SELECT id, name, color, googleEmail, mission, achievement, homepage, feedbackFormUrl FROM councils WHERE id = ?"
           ).bind(id).first();
 
           if (!council) {
@@ -566,6 +580,7 @@ export default {
               mission: council.mission,
               achievement: council.achievement,
               homepage: council.homepage,
+              feedbackFormUrl: council.feedbackFormUrl || '',
               name: council.name,
               color: council.color,
               googleEmail: council.googleEmail,
@@ -653,13 +668,21 @@ export default {
       if (path === "/api/council/save" && method === "POST") {
         try {
           const body = await request.json();
-          const { id, name, mission, achievement, homepage, color, googleEmail, info, padlets, mainProjectTitle, mainProjectProgress, mainProjectStatus } = body;
+          await ensureCouncilFeedbackColumn(env);
+          const { id, name, mission, achievement, homepage, feedbackFormUrl, color, googleEmail, info, padlets, mainProjectTitle, mainProjectProgress, mainProjectStatus } = body;
 
           // Extract values from either top-level or info wrapper
           const councilName = name || info?.name || '';
           const councilMission = mission || info?.mission || '';
           const councilAchievement = achievement || info?.achievement || '';
           const councilHomepage = homepage || info?.homepage || '';
+          const councilFeedbackFormUrl = feedbackFormUrl || info?.feedbackFormUrl || '';
+          if (councilFeedbackFormUrl) {
+            const formUrl = new URL(councilFeedbackFormUrl);
+            if (formUrl.protocol !== "https:" || !(/(^|\.)google\.com$/i.test(formUrl.hostname) || formUrl.hostname === "forms.gle")) {
+              return json({ error: "INVALID_FEEDBACK_FORM_URL" }, 400);
+            }
+          }
           const councilColor = color || info?.color || '';
           const councilEmail = googleEmail || info?.googleEmail || '';
           
@@ -668,9 +691,9 @@ export default {
           const projStatus = mainProjectStatus || info?.mainProjectStatus || 'Not Started';
 
           await env.councils_db.prepare(
-            "INSERT INTO councils (id, name, color, googleEmail, mission, achievement, homepage, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
-            "ON CONFLICT(id) DO UPDATE SET name = excluded.name, mission = excluded.mission, achievement = excluded.achievement, homepage = excluded.homepage, color = excluded.color, googleEmail = excluded.googleEmail, updatedAt = CURRENT_TIMESTAMP"
-          ).bind(id, councilName, councilColor, councilEmail, councilMission, councilAchievement, councilHomepage).run();
+            "INSERT INTO councils (id, name, color, googleEmail, mission, achievement, homepage, feedbackFormUrl, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
+            "ON CONFLICT(id) DO UPDATE SET name = excluded.name, mission = excluded.mission, achievement = excluded.achievement, homepage = excluded.homepage, feedbackFormUrl = excluded.feedbackFormUrl, color = excluded.color, googleEmail = excluded.googleEmail, updatedAt = CURRENT_TIMESTAMP"
+          ).bind(id, councilName, councilColor, councilEmail, councilMission, councilAchievement, councilHomepage, councilFeedbackFormUrl).run();
 
           // Save Main Project
           if (title && title.trim() !== '') {

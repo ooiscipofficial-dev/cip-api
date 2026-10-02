@@ -8,6 +8,7 @@ CREATE TABLE councils (
   mission TEXT,
   achievement TEXT,
   homepage TEXT,
+  feedbackFormUrl TEXT DEFAULT '',
   createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
   updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
 );
