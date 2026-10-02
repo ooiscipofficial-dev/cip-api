@@ -5,6 +5,7 @@ CREATE TABLE initiatives (
   councilId TEXT NOT NULL,
   title TEXT NOT NULL,
   description TEXT,
+  detailsMarkdown TEXT DEFAULT '',
   objectives TEXT,
   expectedOutcomes TEXT,
   registrationFormUrl TEXT,

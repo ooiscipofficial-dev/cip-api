@@ -44,6 +44,7 @@ function calculateImpactScore(data = {}) {
 }
 
 const INITIATIVE_AUDIT_COLUMNS = {
+  detailsMarkdown: "TEXT DEFAULT ''",
   registrationFormUrl: "TEXT",
   executedOnTime: "INTEGER",
   successNote: "TEXT",
@@ -597,8 +598,19 @@ export default {
           const result = await env.councils_db.prepare(
             "SELECT mission as commonsPadlet FROM councils WHERE id = 'system'"
           ).first();
-          
-          return json({ settings: result || { commonsPadlet: "" } });
+
+          // Settings were originally stored as a single Commons URL. Support that
+          // legacy value while allowing additional global board links.
+          let settings = { commonsPadlet: "", announcementsPadlet: "" };
+          if (result?.commonsPadlet) {
+            try {
+              settings = { ...settings, ...JSON.parse(result.commonsPadlet) };
+            } catch {
+              settings.commonsPadlet = result.commonsPadlet;
+            }
+          }
+
+          return json({ settings });
         } catch (err) {
           return json({ error: "SETTINGS_FETCH_FAILED", details: err.message }, 500);
         }
@@ -607,12 +619,29 @@ export default {
       // ─── 4.6 SAVE SYSTEM SETTINGS ──────────────────────────────────────
       if (path === "/api/system/settings" && method === "POST") {
         try {
-          const { commonsPadlet } = await request.json();
+          const incoming = await request.json();
+          const existing = await env.councils_db.prepare(
+            "SELECT mission FROM councils WHERE id = 'system'"
+          ).first();
+          let currentSettings = { commonsPadlet: "", announcementsPadlet: "" };
+          if (existing?.mission) {
+            try {
+              currentSettings = { ...currentSettings, ...JSON.parse(existing.mission) };
+            } catch {
+              currentSettings.commonsPadlet = existing.mission;
+            }
+          }
+
+          const settings = {
+            ...currentSettings,
+            ...(Object.prototype.hasOwnProperty.call(incoming, "commonsPadlet") ? { commonsPadlet: incoming.commonsPadlet || "" } : {}),
+            ...(Object.prototype.hasOwnProperty.call(incoming, "announcementsPadlet") ? { announcementsPadlet: incoming.announcementsPadlet || "" } : {}),
+          };
           
           await env.councils_db.prepare(
             "INSERT INTO councils (id, name, mission, updatedAt) VALUES ('system', 'System Settings', ?, CURRENT_TIMESTAMP) " +
             "ON CONFLICT(id) DO UPDATE SET mission = excluded.mission, updatedAt = CURRENT_TIMESTAMP"
-          ).bind(commonsPadlet).run();
+          ).bind(JSON.stringify(settings)).run();
 
           return json({ success: true });
         } catch (err) {
@@ -891,6 +920,7 @@ export default {
             id,
             title,
             description,
+            detailsMarkdown,
             objectives,
             expectedOutcomes,
             registrationFormUrl,
@@ -911,13 +941,14 @@ export default {
           } = await request.json();
 
           await env.initiatives_db.prepare(
-            "INSERT INTO initiatives (id, councilId, title, description, objectives, expectedOutcomes, registrationFormUrl, initiativeType, executionDate, status, isSuccessful, successVisible, executedOnTime, successNote, completedAt, completedBy, managerNote, reviewedBy, dateReviewed, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
-            "ON CONFLICT(id) DO UPDATE SET title = excluded.title, description = excluded.description, objectives = excluded.objectives, expectedOutcomes = excluded.expectedOutcomes, registrationFormUrl = excluded.registrationFormUrl, initiativeType = excluded.initiativeType, executionDate = excluded.executionDate, status = excluded.status, isSuccessful = excluded.isSuccessful, successVisible = excluded.successVisible, executedOnTime = excluded.executedOnTime, successNote = excluded.successNote, completedAt = excluded.completedAt, completedBy = excluded.completedBy, managerNote = excluded.managerNote, reviewedBy = excluded.reviewedBy, dateReviewed = excluded.dateReviewed, updatedAt = CURRENT_TIMESTAMP"
+            "INSERT INTO initiatives (id, councilId, title, description, detailsMarkdown, objectives, expectedOutcomes, registrationFormUrl, initiativeType, executionDate, status, isSuccessful, successVisible, executedOnTime, successNote, completedAt, completedBy, managerNote, reviewedBy, dateReviewed, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
+            "ON CONFLICT(id) DO UPDATE SET title = excluded.title, description = excluded.description, detailsMarkdown = excluded.detailsMarkdown, objectives = excluded.objectives, expectedOutcomes = excluded.expectedOutcomes, registrationFormUrl = excluded.registrationFormUrl, initiativeType = excluded.initiativeType, executionDate = excluded.executionDate, status = excluded.status, isSuccessful = excluded.isSuccessful, successVisible = excluded.successVisible, executedOnTime = excluded.executedOnTime, successNote = excluded.successNote, completedAt = excluded.completedAt, completedBy = excluded.completedBy, managerNote = excluded.managerNote, reviewedBy = excluded.reviewedBy, dateReviewed = excluded.dateReviewed, updatedAt = CURRENT_TIMESTAMP"
           ).bind(
             id,
             councilId,
             title,
             description,
+            detailsMarkdown || '',
             objectives,
             expectedOutcomes,
             registrationFormUrl || '',
