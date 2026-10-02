@@ -44,6 +44,7 @@ function calculateImpactScore(data = {}) {
 }
 
 const INITIATIVE_AUDIT_COLUMNS = {
+  registrationFormUrl: "TEXT",
   executedOnTime: "INTEGER",
   successNote: "TEXT",
   completedAt: "DATETIME",
@@ -133,6 +134,12 @@ function isManagerRequest(request) {
   return token.startsWith("mng_");
 }
 
+async function ensureActivityAuditSchema(env) {
+  await env.councils_db.prepare(
+    "CREATE TABLE IF NOT EXISTS activity_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, councilId TEXT, initiativeId TEXT, actorName TEXT, actorUsername TEXT, actorType TEXT, action TEXT NOT NULL, activeSeconds INTEGER DEFAULT 0, createdAt DATETIME DEFAULT CURRENT_TIMESTAMP)"
+  ).run();
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
@@ -205,6 +212,29 @@ export default {
         } catch (err) {
           return json({ error: "QUERY_FAILED", details: err.message }, 500);
         }
+      }
+
+      if (path === "/api/activity/track" && method === "POST") {
+        try {
+          await ensureActivityAuditSchema(env);
+          const { councilId = '', initiativeId = '', actorName = '', actorUsername = '', actorType = 'member', action, activeSeconds = 0 } = await request.json();
+          if (!action) return json({ error: "MISSING_ACTION" }, 400);
+          await env.councils_db.prepare(
+            "INSERT INTO activity_audit (councilId, initiativeId, actorName, actorUsername, actorType, action, activeSeconds) VALUES (?, ?, ?, ?, ?, ?, ?)"
+          ).bind(councilId, initiativeId, actorName, actorUsername, actorType, action, Math.max(0, Math.min(Number(activeSeconds) || 0, 86400))).run();
+          return json({ success: true });
+        } catch (err) { return json({ error: "ACTIVITY_TRACK_FAILED", details: err.message }, 500); }
+      }
+
+      if (path === "/api/activity/list" && method === "GET") {
+        try {
+          if (!isManagerRequest(request)) return json({ error: "UNAUTHORIZED" }, 401);
+          await ensureActivityAuditSchema(env);
+          const { results = [] } = await env.councils_db.prepare(
+            "SELECT * FROM activity_audit ORDER BY createdAt DESC, id DESC LIMIT 500"
+          ).all();
+          return json({ activity: results });
+        } catch (err) { return json({ error: "ACTIVITY_LIST_FAILED", details: err.message }, 500); }
       }
 
       // ─── 4.0 SUPER-AGGREGATE: GET EVERYTHING FOR ALL COUNCILS ──────────
@@ -567,6 +597,63 @@ export default {
         }
       }
 
+      // Manager-only council administration, used by Member Credentials.
+      if (path === "/api/councils/create" && method === "POST") {
+        try {
+          if (!isManagerRequest(request)) return json({ error: "UNAUTHORIZED" }, 401);
+          const { id, name, color, googleEmail = "" } = await request.json();
+          const councilId = String(id || "").trim().toLowerCase();
+          const councilName = String(name || "").trim();
+          if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(councilId) || !councilName) {
+            return json({ error: "INVALID_COUNCIL" }, 400);
+          }
+
+          await env.councils_db.prepare(
+            "INSERT INTO councils (id, name, color, googleEmail, createdAt, updatedAt) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+          ).bind(councilId, councilName, color || "#6366f1", googleEmail).run();
+          return json({ success: true, council: { id: councilId, name: councilName, color: color || "#6366f1", googleEmail } });
+        } catch (err) {
+          return json({ error: "COUNCIL_CREATE_FAILED", details: err.message }, 500);
+        }
+      }
+
+      if (path === "/api/councils/delete" && method === "POST") {
+        try {
+          if (!isManagerRequest(request)) return json({ error: "UNAUTHORIZED" }, 401);
+          const { councilId } = await request.json();
+          if (!councilId || councilId === "system") return json({ error: "INVALID_COUNCIL" }, 400);
+          await ensureInitiativePeopleSchema(env);
+          const { results: initiativeRows = [] } = await env.initiatives_db.prepare(
+            "SELECT id FROM initiatives WHERE councilId = ?"
+          ).bind(councilId).all();
+          const initiativeIds = initiativeRows.map(row => row.id);
+          const initiativeStatements = initiativeIds.flatMap(id => [
+            env.initiatives_db.prepare("DELETE FROM manager_comments WHERE initiativeId = ?").bind(id),
+            env.initiatives_db.prepare("DELETE FROM progress_reports WHERE initiativeId = ?").bind(id),
+            env.initiatives_db.prepare("DELETE FROM initiative_status_history WHERE initiativeId = ?").bind(id),
+            env.initiatives_db.prepare("DELETE FROM initiative_leads WHERE initiativeId = ?").bind(id),
+            env.initiatives_db.prepare("DELETE FROM initiative_lead_students WHERE initiativeId = ?").bind(id),
+            env.initiatives_db.prepare("DELETE FROM initiative_contributors WHERE initiativeId = ?").bind(id),
+            env.initiatives_db.prepare("DELETE FROM initiatives WHERE id = ?").bind(id),
+          ]);
+          if (initiativeStatements.length) await env.initiatives_db.batch(initiativeStatements);
+          await env.councils_db.batch([
+            env.councils_db.prepare("DELETE FROM members WHERE councilId = ?").bind(councilId),
+            env.councils_db.prepare("DELETE FROM credentials WHERE councilId = ?").bind(councilId),
+            env.councils_db.prepare("DELETE FROM councils WHERE id = ?").bind(councilId),
+          ]);
+          await env.resources_db.batch([
+            env.resources_db.prepare("DELETE FROM padlets WHERE councilId = ?").bind(councilId),
+            env.resources_db.prepare("DELETE FROM projects WHERE councilId = ?").bind(councilId),
+            env.resources_db.prepare("DELETE FROM strategic_analysis WHERE councilId = ?").bind(councilId),
+            env.resources_db.prepare("DELETE FROM timeline_events WHERE councilId = ?").bind(councilId),
+          ]);
+          return json({ success: true });
+        } catch (err) {
+          return json({ error: "COUNCIL_DELETE_FAILED", details: err.message }, 500);
+        }
+      }
+
       // ─── X. GET/SAVE PADLETS ENDPOINT (PadletSection.jsx) ───────────────
       const padletMatch = path.match(/^\/api\/councils\/([^/]+)\/padlets$/);
       if (padletMatch) {
@@ -726,6 +813,7 @@ export default {
             description,
             objectives,
             expectedOutcomes,
+            registrationFormUrl,
             initiativeType,
             executionDate,
             status,
@@ -743,8 +831,8 @@ export default {
           } = await request.json();
 
           await env.initiatives_db.prepare(
-            "INSERT INTO initiatives (id, councilId, title, description, objectives, expectedOutcomes, initiativeType, executionDate, status, isSuccessful, successVisible, executedOnTime, successNote, completedAt, completedBy, managerNote, reviewedBy, dateReviewed, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
-            "ON CONFLICT(id) DO UPDATE SET title = excluded.title, description = excluded.description, objectives = excluded.objectives, expectedOutcomes = excluded.expectedOutcomes, initiativeType = excluded.initiativeType, executionDate = excluded.executionDate, status = excluded.status, isSuccessful = excluded.isSuccessful, successVisible = excluded.successVisible, executedOnTime = excluded.executedOnTime, successNote = excluded.successNote, completedAt = excluded.completedAt, completedBy = excluded.completedBy, managerNote = excluded.managerNote, reviewedBy = excluded.reviewedBy, dateReviewed = excluded.dateReviewed, updatedAt = CURRENT_TIMESTAMP"
+            "INSERT INTO initiatives (id, councilId, title, description, objectives, expectedOutcomes, registrationFormUrl, initiativeType, executionDate, status, isSuccessful, successVisible, executedOnTime, successNote, completedAt, completedBy, managerNote, reviewedBy, dateReviewed, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
+            "ON CONFLICT(id) DO UPDATE SET title = excluded.title, description = excluded.description, objectives = excluded.objectives, expectedOutcomes = excluded.expectedOutcomes, registrationFormUrl = excluded.registrationFormUrl, initiativeType = excluded.initiativeType, executionDate = excluded.executionDate, status = excluded.status, isSuccessful = excluded.isSuccessful, successVisible = excluded.successVisible, executedOnTime = excluded.executedOnTime, successNote = excluded.successNote, completedAt = excluded.completedAt, completedBy = excluded.completedBy, managerNote = excluded.managerNote, reviewedBy = excluded.reviewedBy, dateReviewed = excluded.dateReviewed, updatedAt = CURRENT_TIMESTAMP"
           ).bind(
             id,
             councilId,
@@ -752,6 +840,7 @@ export default {
             description,
             objectives,
             expectedOutcomes,
+            registrationFormUrl || '',
             initiativeType,
             executionDate,
             String(status || 'pending').toLowerCase(),

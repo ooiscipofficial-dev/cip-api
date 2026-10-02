@@ -34,3 +34,15 @@ CREATE TABLE credentials (
   createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (councilId) REFERENCES councils(id) ON DELETE CASCADE
 );
+
+CREATE TABLE activity_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  councilId TEXT,
+  initiativeId TEXT,
+  actorName TEXT,
+  actorUsername TEXT,
+  actorType TEXT,
+  action TEXT NOT NULL,
+  activeSeconds INTEGER DEFAULT 0,
+  createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+);

@@ -7,6 +7,7 @@ CREATE TABLE initiatives (
   description TEXT,
   objectives TEXT,
   expectedOutcomes TEXT,
+  registrationFormUrl TEXT,
   initiativeType TEXT,
   executionDate TEXT,
   status TEXT DEFAULT 'pending',
